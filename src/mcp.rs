@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{deepseek::DeepSeekClient, error::AppError, tools};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+const CURRENT_PROTOCOL_VERSION: &str = "2025-11-25";
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION];
 const SERVER_NAME: &str = "deepseek-search-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_INPUT_LINE_BYTES: usize = 1024 * 1024;
@@ -305,16 +307,18 @@ fn dispatch_request(request: &Request) -> Value {
                 .as_ref()
                 .and_then(|params| params.get("protocolVersion"))
                 .and_then(Value::as_str);
-            if version != Some(PROTOCOL_VERSION) {
+            let Some(version) =
+                version.filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+            else {
                 return error_response(
                     request.id.as_ref().map(RequestId::value),
                     -32602,
                     "Unsupported protocol version",
                 );
-            }
+            };
             success(
                 request.id.as_ref(),
-                json!({"protocolVersion": PROTOCOL_VERSION, "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}, "capabilities": {"tools": {}}}),
+                json!({"protocolVersion": version, "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}, "capabilities": {"tools": {}}}),
             )
         }
         "tools/list" => success(
@@ -504,6 +508,43 @@ mod tests {
         assert_eq!(tools[1]["name"], "fetch");
     }
 
+    #[tokio::test]
+    async fn accepts_ox_current_protocol_version() {
+        let responses = run(
+            client("http://127.0.0.1:1"),
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "ox", "version": "test"}
+                }
+            })],
+        )
+        .await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_protocol_version() {
+        let responses = run(
+            client("http://127.0.0.1:1"),
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "unknown"}
+            })],
+        )
+        .await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["error"]["code"], -32602);
+    }
     #[tokio::test]
     async fn invalid_arguments_return_tool_error_without_http_request() {
         let mock = MockServer::start().await;
