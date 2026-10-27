@@ -78,10 +78,11 @@ export DEEPSEEK_API_KEY
 
 Connect with ox or an MCP inspector and verify that:
 
-1. `tools/list` exposes exactly `search` and `fetch`.
-2. `search` returns results for a current technical question without page bodies by default.
-3. `fetch` returns the body for one selected search URL.
-4. stdout contains only MCP JSON-RPC lines, while diagnostics appear on stderr and never contain the key.
-5. Closing the client or cancelling a slow request stops the active operation cleanly.
+1. `server/discover` with protocol version `2026-07-28` returns the server title, version, and tools capability.
+2. `tools/list` exposes exactly `search` and `fetch`; modern requests carry protocol metadata in `params._meta`.
+3. `search` returns results for a current technical question without page bodies by default.
+4. `fetch` returns the body for one selected search URL.
+5. stdout contains only MCP JSON-RPC lines, while diagnostics appear on stderr and never contain the key.
+6. Closing the client or cancelling a slow request stops the active operation cleanly.
 
 See [DESIGN.md](DESIGN.md) for the complete protocol, module-boundary, security, and test design.

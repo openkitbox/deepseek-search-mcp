@@ -2,7 +2,7 @@
 
 ## 1. 项目定位
 
-`deepseek-search-mcp` 是一个独立的 Rust MCP server，为支持 MCP 的客户端提供 DeepSeek 的网页搜索与网页抓取能力。
+`deepseek-search-mcp` 是一个独立的 MCP server，为支持 MCP 的客户端提供 DeepSeek 的网页搜索与网页抓取能力。
 
 第一版只支持 MCP stdio transport，目标客户端包括 ox、Claude Code、Codex 以及其他本地 MCP host。项目不依赖 ox 的源码、配置或运行时；ox 只是其中一个 MCP client。
 
@@ -74,7 +74,7 @@ MCP 工具参数：
 
 ```json
 {
-  "query": "Rust MCP server implementation",
+  "query": "MCP server implementation",
   "count": 5,
   "ori_question": "用户的原始问题，可选",
   "localization": "可选的本地化搜索 IP 地址",
@@ -116,7 +116,7 @@ DeepSeek 成功响应的主要字段：
 }
 ```
 
-Rust response model：
+Response model：
 
 - 必需的顶层 `results` 缺失或不是数组视为上游协议错误。
 - 结果中的可选字段使用 `Option`；未知字段忽略。
@@ -129,7 +129,7 @@ MCP 成功结果以一个 `text` content block 返回 JSON 文本，保证老 MC
 
 ```json
 {
-  "query": "Rust MCP server implementation",
+  "query": "MCP server implementation",
   "results": [
     {
       "title": "...",
@@ -197,17 +197,17 @@ MCP 工具参数：
 
 ### 4.2 生命周期
 
-实现最小 MCP 生命周期：
+实现按请求兼容 modern 与 legacy 两种 MCP 生命周期；这是 DeepSeek server 的请求分类，不是 ox client 在握手失败后的 fallback：
 
-1. 接收 `initialize`，校验 JSON-RPC 请求，返回协议版本、serverInfo 和 capabilities.tools。
-2. 接收 `notifications/initialized`，不返回 response。
-3. 接收 `tools/list`，返回两个工具定义及 JSON Schema。
-4. 接收 `tools/call`，按 request id 执行 `search` 或 `fetch`。
+1. legacy 生命周期接收 `initialize`，返回 `protocolVersion`、包含 `name`、`title`、`version` 的 `serverInfo` 和 `capabilities.tools`；`notifications/initialized` 没有 response。
+2. modern 生命周期接收 `server/discover` 请求。`params._meta` 必须是对象，并包含与 `PROTOCOL_VERSION` 完全相等的字符串 `protocolVersion`、对象 `clientInfo` 和对象 `clientCapabilities`；校验失败返回 `-32602`。成功响应包含 `protocolVersion`、`serverInfo` 和 `capabilities`。
+3. `tools/list` 和 `tools/call` 没有 `_meta` 时按 legacy 处理；存在 `_meta` 时按 modern 处理并严格校验同一组 metadata，校验失败返回 `-32602`，不得静默降级为 legacy。两种路径共享同一工具目录、`dispatch_request` 和 `dispatch_tool` 边界；成功的 `tools/list` 返回恰好两个工具定义及 JSON Schema，`tools/call` 按 request id 执行 `search` 或 `fetch`。
+4. `notifications/cancelled` 仍按 `requestId` 取消对应的运行中调用，也不产生 response；不存在的 request id 安全忽略。
 5. 对未知 method 返回 JSON-RPC method-not-found；对未知 tool 返回 MCP tool error。
 6. 对 malformed JSON 或无效 JSON-RPC 请求返回标准 JSON-RPC parse/invalid-request error；无法可靠取得 id 时使用 null 或不回复，遵循 JSON-RPC 语义。
-7. EOF、SIGTERM 或 stdin 关闭时优雅退出，不输出额外 stdout 内容。
+7. EOF 或 stdin 关闭时停止读取新请求，等待已启动的 tool task 完成后优雅退出。SIGTERM 停止读取并取消所有运行中的调用，等待 task 收尾后退出；取消产生的 tool error response 仍可在退出前写出。两种情况都不输出非 JSON 内容。
 
-协议版本采用代码中的常量，并优先与当前 MCP host 协商；不要把版本字符串散落在多个模块。若客户端发送不支持的版本，返回明确的 initialize error，而不是静默降级到不兼容语义。
+协议版本集中在代码中的 `PROTOCOL_VERSION` 常量；modern 请求的 `_meta.protocolVersion` 必须严格匹配。legacy 是请求中不存在 `_meta` 的明确分类，不是 modern metadata 校验失败后的 fallback，也不做版本协商。
 
 ### 4.3 Tool 定义
 
@@ -241,7 +241,7 @@ MCP 层面的工具执行失败使用 `CallToolResult.isError=true`，并返回�
 
 - 面向模型，说明失败类别和下一步；
 - 不包含 API key、Authorization header、完整上游响应 body 或敏感 URL 凭据；
-- 不泄漏 Rust debug dump；
+- 不泄漏 debug dump；
 - 保留可诊断的 HTTP status 和 DeepSeek `error.message` 的安全摘要。
 
 JSON-RPC 层错误只用于协议错误；DeepSeek HTTP 错误和参数错误属于 tool error，不应让整个 MCP session 崩溃。
@@ -362,17 +362,17 @@ mock server 断言：
 
 使用内存 stdin/stdout 或子进程测试真实二进制协议：
 
-- initialize → initialized → tools/list；
-- tools/list 恰好暴露 search、fetch，schema 与必填字段正确；
-- tools/call search 返回 JSON text content；
-- tools/call fetch 返回 title/url/content；
+- `server/discover`（带合法 `params._meta`）返回协议版本、`serverInfo`（含 name/title/version）和 `capabilities.tools`；缺失或错误的 modern metadata 返回 `-32602`；
+- legacy `initialize` 成功返回协议版本、`serverInfo` 和 `capabilities.tools`；
+- 没有 `params._meta` 的 legacy `tools/list` 和 `tools/call` 成功处理；`tools/list` 恰好暴露 search、fetch，schema 与必填字段正确，`tools/call` 的 search 返回 JSON text content、fetch 返回 title/url/content；
+- 带合法 `params._meta` 的 modern `tools/list` 和 `tools/call` 成功处理；存在错误 metadata 时返回 `-32602`，不得降级为 legacy；
+- `notifications/initialized` 不产生 response；
 - 非法参数返回 isError，不发 HTTP 请求；
 - unknown tool 返回 isError；
-- malformed JSON 不会污染 stdout；
+- malformed JSON 返回 parse error，其他无效 JSON-RPC 请求返回 invalid-request error，且不会污染 stdout；
 - 多个并发 request 的 response id 正确且 JSON 行不交错；
-- notifications/initialized 和 notifications/cancelled 不产生错误 response；
-- 取消后 request map 被清理；
-- EOF 正常退出。
+- `notifications/cancelled` 按 request id 取消调用但不产生 response；
+- EOF 正常退出，SIGTERM 会取消运行中的调用并优雅退出；
 
 ### 8.4 最小人工 smoke test
 
@@ -435,7 +435,7 @@ DEEPSEEK_API_KEY=... cargo run --release
 实现只有同时满足以下条件才算第一版完成：
 
 - `cargo test --all-targets`、fmt、clippy 和 release build 全部通过。
-- 使用标准 MCP client 可以完成 initialize、tools/list、search、fetch。
+- 使用标准 MCP client 可以完成 `server/discover`、`tools/list`、search、fetch。
 - ox 通过本地 stdio 配置可以发现并调用两个工具，无需修改 ox 源码。
 - Search 默认不带正文，Fetch 负责单页正文获取。
 - 所有 HTTP 错误、协议错误、参数错误都不会让 server 无条件崩溃，也不会污染 stdout。

@@ -8,10 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{deepseek::DeepSeekClient, error::AppError, tools};
 
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
-const CURRENT_PROTOCOL_VERSION: &str = "2025-11-25";
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] = [PROTOCOL_VERSION, CURRENT_PROTOCOL_VERSION];
+pub const PROTOCOL_VERSION: &str = "2026-07-28";
 const SERVER_NAME: &str = "deepseek-search-mcp";
+const SERVER_TITLE: &str = "DeepSeek Search MCP";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_INPUT_LINE_BYTES: usize = 1024 * 1024;
 const RESPONSE_CHANNEL_CAPACITY: usize = 64;
@@ -85,6 +84,17 @@ impl McpServer {
             let Some(id) = request.id.clone() else {
                 continue;
             };
+            let requires_modern_metadata = request.method == "server/discover"
+                || matches!(request.method.as_str(), "tools/list" | "tools/call")
+                    && has_metadata(request.params.as_ref());
+            if requires_modern_metadata && !has_valid_modern_metadata(request.params.as_ref()) {
+                send(
+                    &responses,
+                    error_response(Some(id.value()), -32602, "Invalid modern protocol metadata"),
+                )
+                .await?;
+                continue;
+            }
             if request.method == "tools/call" {
                 let permit = match Arc::clone(&permits).try_acquire_owned() {
                     Ok(permit) => permit,
@@ -301,37 +311,51 @@ async fn cancel_all(cancellations: &Mutex<HashMap<RequestId, CancellationToken>>
 
 fn dispatch_request(request: &Request) -> Value {
     match request.method.as_str() {
-        "initialize" => {
-            let version = request
-                .params
-                .as_ref()
-                .and_then(|params| params.get("protocolVersion"))
-                .and_then(Value::as_str);
-            let Some(version) =
-                version.filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
-            else {
-                return error_response(
-                    request.id.as_ref().map(RequestId::value),
-                    -32602,
-                    "Unsupported protocol version",
-                );
-            };
-            success(
-                request.id.as_ref(),
-                json!({"protocolVersion": version, "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}, "capabilities": {"tools": {}}}),
-            )
-        }
+        "initialize" => success(
+            request.id.as_ref(),
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE, "version": SERVER_VERSION},
+                "capabilities": {"tools": {}}
+            }),
+        ),
+        "server/discover" => success(
+            request.id.as_ref(),
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE, "version": SERVER_VERSION},
+                "capabilities": {"tools": {}}
+            }),
+        ),
         "tools/list" => success(
             request.id.as_ref(),
             json!({"tools": [tools::search_tool(), tools::fetch_tool()]}),
         ),
-        "notifications/initialized" => Value::Null,
         _ => error_response(
             request.id.as_ref().map(RequestId::value),
             -32601,
             "Method not found",
         ),
     }
+}
+
+fn has_valid_modern_metadata(params: Option<&Value>) -> bool {
+    let Some(meta) = params
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("_meta"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    meta.get("protocolVersion").and_then(Value::as_str) == Some(PROTOCOL_VERSION)
+        && meta.get("clientInfo").is_some_and(Value::is_object)
+        && meta.get("clientCapabilities").is_some_and(Value::is_object)
+}
+
+fn has_metadata(params: Option<&Value>) -> bool {
+    params
+        .and_then(Value::as_object)
+        .is_some_and(|params| params.contains_key("_meta"))
 }
 
 async fn dispatch_tool(
@@ -431,8 +455,8 @@ mod tests {
     };
 
     use super::{
-        BoundedLine, MAX_INPUT_LINE_BYTES, McpServer, PROTOCOL_VERSION, RequestId, cancel_all,
-        read_bounded_line,
+        BoundedLine, MAX_INPUT_LINE_BYTES, McpServer, PROTOCOL_VERSION, RequestId, SERVER_NAME,
+        SERVER_TITLE, cancel_all, read_bounded_line,
     };
     use crate::{config::Config, deepseek::DeepSeekClient};
 
@@ -485,65 +509,143 @@ mod tests {
             .collect()
     }
 
+    fn modern_meta() -> Value {
+        json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "clientInfo": {"name": "ox", "version": "test"},
+            "clientCapabilities": {}
+        })
+    }
+
     #[tokio::test]
-    async fn initialize_initialized_and_list_expose_exact_tools() {
+    async fn discovery_returns_modern_server_metadata_and_capabilities() {
+        let responses = run(
+            client("http://127.0.0.1:1"),
+            &[json!({
+                "jsonrpc": "2.0",
+                "id": "discover",
+                "method": "server/discover",
+                "params": {"_meta": modern_meta()}
+            })],
+        )
+        .await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(
+            responses[0]["result"]["serverInfo"]["name"],
+            "deepseek-search-mcp"
+        );
+        assert_eq!(
+            responses[0]["result"]["serverInfo"]["title"],
+            "DeepSeek Search MCP"
+        );
+        assert!(responses[0]["result"]["serverInfo"]["version"].is_string());
+        assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn legacy_initialize_returns_server_capabilities() {
+        let responses = run(
+            client("http://127.0.0.1:1"),
+            &[json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})],
+        )
+        .await;
+
+        assert_eq!(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(responses[0]["result"]["serverInfo"]["name"], SERVER_NAME);
+        assert_eq!(responses[0]["result"]["serverInfo"]["title"], SERVER_TITLE);
+        assert!(responses[0]["result"]["serverInfo"]["version"].is_string());
+        assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_missing_or_wrong_modern_metadata() {
         let responses = run(
             client("http://127.0.0.1:1"),
             &[
-                json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":PROTOCOL_VERSION,"capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
-                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
+                json!({"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{"protocolVersion":"unknown","clientInfo":{},"clientCapabilities":{}}}}),
+                json!({"jsonrpc":"2.0","id":3,"method":"server/discover","params":{"_meta":{"protocolVersion":PROTOCOL_VERSION,"clientInfo":"bad","clientCapabilities":{}}}}),
+                json!({"jsonrpc":"2.0","id":4,"method":"server/discover","params":[]}),
             ],
         )
         .await;
-        assert_eq!(responses.len(), 2);
-        assert_eq!(responses[0]["id"], "init");
-        assert_eq!(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
-        let tools = responses[1]["result"]["tools"]
+
+        assert_eq!(responses.len(), 4);
+        for response in responses {
+            assert_eq!(response["error"]["code"], -32602);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_tools_list_without_metadata_returns_tools() {
+        let responses = run(
+            client("http://127.0.0.1:1"),
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":modern_meta()}}),
+            ],
+        )
+        .await;
+
+        let tools = responses[0]["result"]["tools"]
             .as_array()
             .expect("tools array");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "search");
         assert_eq!(tools[1]["name"], "fetch");
+        assert_eq!(
+            responses[1]["result"]["tools"],
+            responses[0]["result"]["tools"]
+        );
     }
 
     #[tokio::test]
-    async fn accepts_ox_current_protocol_version() {
+    async fn legacy_tools_call_without_metadata_executes_tool() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tools/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[]})))
+            .expect(1)
+            .mount(&mock)
+            .await;
         let responses = run(
-            client("http://127.0.0.1:1"),
+            client(&mock.uri()),
             &[json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {},
-                    "clientInfo": {"name": "ox", "version": "test"}
-                }
+                "method": "tools/call",
+                "params": {"name": "search", "arguments": {"query": "rust"}}
             })],
         )
         .await;
 
-        assert_eq!(responses.len(), 1);
-        assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
+        assert_eq!(responses[0]["result"]["isError"], false);
+        mock.verify().await;
     }
 
     #[tokio::test]
-    async fn rejects_unknown_protocol_version() {
+    async fn tools_list_and_call_reject_invalid_metadata_without_legacy_fallback() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tools/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results":[]})))
+            .expect(0)
+            .mount(&mock)
+            .await;
         let responses = run(
-            client("http://127.0.0.1:1"),
-            &[json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": "unknown"}
-            })],
+            client(&mock.uri()),
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{}}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":{},"name":"search","arguments":{"query":"rust"}}}),
+            ],
         )
         .await;
 
-        assert_eq!(responses.len(), 1);
         assert_eq!(responses[0]["error"]["code"], -32602);
+        assert_eq!(responses[1]["error"]["code"], -32602);
+        mock.verify().await;
     }
     #[tokio::test]
     async fn invalid_arguments_return_tool_error_without_http_request() {
@@ -556,7 +658,7 @@ mod tests {
             .await;
         let responses = run(
             client(&mock.uri()),
-            &[json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":""}}})],
+            &[json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":modern_meta(),"name":"search","arguments":{"query":""}}})],
         )
         .await;
         assert_eq!(responses[0]["result"]["isError"], true);
@@ -575,8 +677,8 @@ mod tests {
         let responses = run(
             client(&mock.uri()),
             &[
-                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"rust"}}}),
-                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"missing","arguments":{}}}),
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"_meta":modern_meta(),"name":"search","arguments":{"query":"rust"}}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"_meta":modern_meta(),"name":"missing","arguments":{}}}),
             ],
         )
         .await;
@@ -630,6 +732,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_initialize_and_notifications_preserve_jsonrpc_behavior() {
+        let responses = run(
+            client("http://127.0.0.1:1"),
+            &[
+                json!({"jsonrpc":"2.0","id":1,"method":"initialize/unknown","params":{}}),
+                json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}),
+            ],
+        )
+        .await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0]["id"], 1);
+        assert_eq!(responses[0]["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
     async fn concurrent_calls_keep_ids_and_each_response_is_a_complete_line() {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
@@ -645,8 +764,8 @@ mod tests {
         let responses = run(
             client(&mock.uri()),
             &[
-                json!({"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"name":"search","arguments":{"query":"a"}}}),
-                json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search","arguments":{"query":"b"}}}),
+                json!({"jsonrpc":"2.0","id":"a","method":"tools/call","params":{"_meta":modern_meta(),"name":"search","arguments":{"query":"a"}}}),
+                json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"_meta":modern_meta(),"name":"search","arguments":{"query":"b"}}}),
             ],
         )
         .await;
@@ -677,7 +796,7 @@ mod tests {
         let started = Instant::now();
         let responses = run(
             client(&mock.uri()),
-            &[json!({"jsonrpc":"2.0","id":"slow","method":"tools/call","params":{"name":"search","arguments":{"query":"slow"}}})],
+            &[json!({"jsonrpc":"2.0","id":"slow","method":"tools/call","params":{"_meta":modern_meta(),"name":"search","arguments":{"query":"slow"}}})],
         )
         .await;
 
@@ -709,7 +828,7 @@ mod tests {
                 .await
                 .expect("server run");
         });
-        input_writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"cancel-me\",\"method\":\"tools/call\",\"params\":{\"name\":\"search\",\"arguments\":{\"query\":\"slow\"}}}\n").await.expect("call");
+        input_writer.write_all(format!("{}\n", serde_json::json!({"jsonrpc":"2.0","id":"cancel-me","method":"tools/call","params":{"_meta":modern_meta(),"name":"search","arguments":{"query":"slow"}}})).as_bytes()).await.expect("call");
         tokio::time::timeout(Duration::from_secs(1), request_started.notified())
             .await
             .expect("request observed");
