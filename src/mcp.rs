@@ -316,7 +316,8 @@ fn dispatch_request(request: &Request) -> Value {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE, "version": SERVER_VERSION},
-                "capabilities": {"tools": {}}
+                "capabilities": {"tools": {}},
+                "instructions": tools::SERVER_INSTRUCTIONS
             }),
         ),
         "server/discover" => success(
@@ -324,7 +325,8 @@ fn dispatch_request(request: &Request) -> Value {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": SERVER_NAME, "title": SERVER_TITLE, "version": SERVER_VERSION},
-                "capabilities": {"tools": {}}
+                "capabilities": {"tools": {}},
+                "instructions": tools::SERVER_INSTRUCTIONS
             }),
         ),
         "tools/list" => success(
@@ -542,6 +544,10 @@ mod tests {
         );
         assert!(responses[0]["result"]["serverInfo"]["version"].is_string());
         assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(
+            responses[0]["result"]["instructions"],
+            crate::tools::SERVER_INSTRUCTIONS
+        );
     }
 
     #[tokio::test]
@@ -557,6 +563,10 @@ mod tests {
         assert_eq!(responses[0]["result"]["serverInfo"]["title"], SERVER_TITLE);
         assert!(responses[0]["result"]["serverInfo"]["version"].is_string());
         assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(
+            responses[0]["result"]["instructions"],
+            crate::tools::SERVER_INSTRUCTIONS
+        );
     }
 
     #[tokio::test]
